@@ -1,0 +1,29 @@
+# Build directories
+/build/
+/cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Ninja build files (if you use Ninja)
+build.ninja
+rules.ninja
+
+# Binaries
+tsn_udp_demo
+*.o
+*.obj
+*.exe
+
+# IDE / editor directories
+.vscode/
+.idea/
+*.user
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~
