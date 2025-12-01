@@ -13,22 +13,39 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-// This struct is the payload we send over UDP.
-// seq     = sequence number of the packet
-// send_ns = send time in nanoseconds since the sender's start time
-struct ControlPacket {
-    uint64_t seq;
-    int64_t  send_ns;
+namespace tsn_udp {
+
+// Two flow types: control vs logging
+enum class FlowKind : std::uint8_t {
+    Control = 1,
+    Logging = 2,
 };
 
-// Short alias so we don't have to type std::chrono::steady_clock every time
+// Packet we send over UDP.
+// flow    = which flow (Control / Logging)
+// seq     = sequence number
+// send_ns = send time in nanoseconds since client start
+struct FlowPacket {
+    FlowKind flow;
+    std::uint64_t seq;
+    std::int64_t  send_ns;
+};
+
 using steady_clock = std::chrono::steady_clock;
+
+inline const char* flow_to_string(FlowKind f) {
+    switch (f) {
+        case FlowKind::Control: return "CTRL";
+        case FlowKind::Logging: return "LOG ";
+        default:                return "UNK ";
+    }
+}
 
 // =========================
 //   SERVER IMPLEMENTATION
 // =========================
 
-inline void run_server(uint16_t port) {
+inline void run_server(std::uint16_t port) {
     // Create a UDP socket (AF_INET = IPv4, SOCK_DGRAM = UDP)
     int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
@@ -45,9 +62,9 @@ inline void run_server(uint16_t port) {
 
     // Prepare local address to bind to: 0.0.0.0:<port>
     sockaddr_in addr{};
-    addr.sin_family      = AF_INET;              // IPv4
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);    // listen on all interfaces
-    addr.sin_port        = htons(port);          // convert port to network byte order
+    addr.sin_family      = AF_INET;           // IPv4
+    addr.sin_addr.s_addr = htonl(INADDR_ANY); // listen on all interfaces
+    addr.sin_port        = htons(port);       // convert port to network byte order
 
     // Bind the socket to the local address (so we actually "own" this port)
     if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
@@ -58,15 +75,16 @@ inline void run_server(uint16_t port) {
 
     std::cout << "[SERVER] Listening on UDP port " << port << "...\n";
 
-    ControlPacket pkt{};        // buffer for incoming packet
-    sockaddr_in src{};          // will hold sender's address
+    FlowPacket pkt{};          // buffer for incoming packet
+    sockaddr_in src{};         // sender's address
     socklen_t src_len = sizeof(src);
 
-    // Start time reference for latency calculations
-    auto start    = steady_clock::now();
-    uint64_t received = 0;      // count how many packets we've received
+    auto start = steady_clock::now();
 
-    // Main receive loop: runs forever until an error occurs
+    std::uint64_t received_ctrl = 0;
+    std::uint64_t received_log  = 0;
+
+    // Main receive loop
     while (true) {
         ssize_t n = recvfrom(fd,
                              &pkt,
@@ -76,56 +94,68 @@ inline void run_server(uint16_t port) {
                              &src_len);
         if (n < 0) {
             perror("recvfrom");
-            break;  // exit loop on error
+            break;
         }
 
-        // If size doesn't match our struct, ignore it
         if (n != static_cast<ssize_t>(sizeof(pkt))) {
-            std::cerr << "[SERVER] Received unexpected size: " << n << " bytes\n";
+            std::cerr << "[SERVER] Received unexpected size: "
+                      << n << " bytes\n";
             continue;
         }
 
-        // Current time since 'start' in nanoseconds
-        auto   now    = steady_clock::now();
-        int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+        auto now    = steady_clock::now();
+        std::int64_t now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
 
-        // Latency = (receive time) - (send time embedded in packet)
-        int64_t latency_ns = now_ns - pkt.send_ns;
+        std::int64_t latency_ns = now_ns - pkt.send_ns;
+        double latency_us = latency_ns / 1000.0;
 
-        received++;
-        // Print every 100th packet to avoid spamming
-        if (received % 100 == 0) {
-            double latency_us = latency_ns / 1000.0; // convert ns -> microseconds
-            std::cout << "[SERVER] seq=" << pkt.seq
+        if (pkt.flow == FlowKind::Control) {
+            ++received_ctrl;
+            if (received_ctrl % 100 == 0) {
+                std::cout << "[SERVER][" << flow_to_string(pkt.flow) << "] seq="
+                          << pkt.seq << " latency=" << latency_us << " us\n";
+            }
+        } else if (pkt.flow == FlowKind::Logging) {
+            ++received_log;
+            if (received_log % 100 == 0) {
+                std::cout << "[SERVER][" << flow_to_string(pkt.flow) << "] seq="
+                          << pkt.seq << " latency=" << latency_us << " us\n";
+            }
+        } else {
+            std::cerr << "[SERVER] Unknown flow kind, seq=" << pkt.seq
                       << " latency=" << latency_us << " us\n";
         }
     }
 
-    close(fd);  // cleanup
+    close(fd);
 }
 
 // =========================
 //   CLIENT IMPLEMENTATION
 // =========================
 
-inline void run_client(const std::string& server_ip,
-                       uint16_t          port,
-                       int               period_us,
-                       uint64_t          max_packets) {
-    // Create UDP socket
+// Common implementation used by both control & logging flows.
+inline void run_client_common(const std::string& server_ip,
+                              std::uint16_t      port,
+                              int                period_us,
+                              std::uint64_t      max_packets,
+                              FlowKind           flow,
+                              int                tos_value) {
     int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         perror("socket");
         return;
     }
 
-    // Mark packets with IP_TOS = 0x10 so we can prioritize them with 'tc' later.
-    int tos = 0x10;
-    if (setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) < 0) {
-        perror("setsockopt IP_TOS");
+    // Set IP_TOS if requested (for control we use 0x10, for logging 0x00)
+    if (tos_value >= 0) {
+        int tos = tos_value;
+        if (setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) < 0) {
+            perror("setsockopt IP_TOS");
+        }
     }
 
-    // Set up destination address (server)
     sockaddr_in dst{};
     dst.sin_family = AF_INET;
     dst.sin_port   = htons(port);
@@ -135,31 +165,28 @@ inline void run_client(const std::string& server_ip,
         return;
     }
 
-    std::cout << "[CLIENT] Sending to " << server_ip << ":" << port
+    std::cout << "[CLIENT][" << flow_to_string(flow) << "] Sending to "
+              << server_ip << ":" << port
               << " every " << period_us << " us, up to "
               << max_packets << " packets.\n";
 
-    // Reference start time for timestamps
     auto start     = steady_clock::now();
     auto next_send = start;
 
-    ControlPacket pkt{};
+    FlowPacket pkt{};
+    pkt.flow = flow;
 
-    for (uint64_t i = 0; i < max_packets; ++i) {
-        // Compute the desired send time for this iteration
+    for (std::uint64_t i = 0; i < max_packets; ++i) {
         next_send += std::chrono::microseconds(period_us);
-
-        // Sleep until that absolute time (time-triggered behavior)
         std::this_thread::sleep_until(next_send);
 
-        // Timestamp just before sending
-        auto   now     = steady_clock::now();
-        int64_t send_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+        auto now = steady_clock::now();
+        std::int64_t send_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
 
         pkt.seq     = i;
         pkt.send_ns = send_ns;
 
-        // Send one UDP datagram containing our ControlPacket struct
         ssize_t n = sendto(fd,
                            &pkt,
                            sizeof(pkt),
@@ -172,6 +199,26 @@ inline void run_client(const std::string& server_ip,
         }
     }
 
-    std::cout << "[CLIENT] Done sending.\n";
+    std::cout << "[CLIENT][" << flow_to_string(flow) << "] Done sending.\n";
     close(fd);
 }
+
+// Control = high-priority flow (TOS = 0x10)
+inline void run_control_client(const std::string& server_ip,
+                               std::uint16_t      port,
+                               int                period_us,
+                               std::uint64_t      max_packets) {
+    run_client_common(server_ip, port, period_us, max_packets,
+                      FlowKind::Control, 0x10);
+}
+
+// Logging = best-effort flow (TOS = 0x00 / default)
+inline void run_logging_client(const std::string& server_ip,
+                               std::uint16_t      port,
+                               int                period_us,
+                               std::uint64_t      max_packets) {
+    run_client_common(server_ip, port, period_us, max_packets,
+                      FlowKind::Logging, 0x00);
+}
+
+} // namespace tsn_udp
